@@ -1,0 +1,214 @@
+---
+paramss:
+    source_url: "https://www.quantitativo.com/p/robustness-of-the-211-sharpe-mean"
+    title: ""
+title: "asdf"
+---
++ survivorship bias-free dataset
+
++ reduce the risk
+    + focus on S&P 500 constituents. 
+    Also, we will reduce the number of trades in parallel to 3 to lower the # of trades/year.
+
+
+
+```{r}
+if (!requireNamespace("pak")) {
+  install.packages("pak")
+}
+if (!requireNamespace("pacman")) {
+  pak::pak("pacman")
+}
+pacman::p_load(
+  tidyverse,
+  quantmod,
+  TTR,
+  furrr)
+```
+```{r funs}
+# Function to get stock data ----
+get_stock_data <- function(symbol, start_date, end_date) {
+  getSymbols(symbol, from = start_date, to = end_date, auto.assign = FALSE) %>%
+    as.data.frame() %>%
+    rownames_to_column("date") %>%
+    as_tibble() %>%
+    select(date, open = contains("Open"), high = contains("High"), 
+           low = contains("Low"), close = contains("Close"))
+}
+
+# Function to implement the strategy
+implement_strategy <- function(data, roll_mean_days, lower_band_days, lower_band_mult, 
+                               ibs_threshold, sma_days) {
+  data %>%
+    arrange(date) %>%
+    mutate(
+      roll_mean_hl = rollmean(high - low, k = roll_mean_days, fill = NA, align = "right"),
+      ibs = (close - low) / (high - low),
+      lower_band = rollmax(high, k = lower_band_days, fill = NA, align = "right") - 
+        lower_band_mult * roll_mean_hl,
+      sma = SMA(close, n = sma_days),
+      signal = case_when(
+        close < lower_band & ibs < ibs_threshold & close > sma ~ 1,
+        lag(signal) == 1 & (close > lag(high) | close < sma) ~ 0,
+        TRUE ~ 0
+      ),
+      returns = (close / lag(close) - 1) * lag(signal),
+      cum_returns = cumprod(1 + returns) - 1
+    ) %>%
+    drop_na()
+}
+
+# Function to run sensitivity analysis
+run_sensitivity_analysis <- function(symbol, start_date, end_date, params) {
+  data <- get_stock_data(symbol, start_date, end_date)
+  
+  plan(multisession)
+  
+  results <- future_map_dfr(params, function(p) {
+    strategy_results <- implement_strategy(data, p$roll_mean_days, p$lower_band_days, 
+                                           p$lower_band_mult, p$ibs_threshold, p$sma_days)
+    
+    tibble(
+      roll_mean_days = p$roll_mean_days,
+      lower_band_days = p$lower_band_days,
+      lower_band_mult = p$lower_band_mult,
+      ibs_threshold = p$ibs_threshold,
+      sma_days = p$sma_days,
+      total_return = last(strategy_results$cum_returns),
+      sharpe_ratio = SharpeRatio(strategy_results$returns, Rf = 0, p = 0.95)[1]
+    )
+  }, .progress = TRUE)
+  
+  plan(sequential)
+  
+  results
+}
+```
+```{r parms}
+
+# Define parameter grid
+param_grid <- expand_grid(
+  roll_mean_days = c(23, 24, 25, 26, 27),
+  lower_band_days = c(8, 9, 10, 11, 12),
+  lower_band_mult = c(2.3, 2.4, 2.5, 2.6, 2.7),
+  ibs_threshold = c(0.28, 0.29, 0.30, 0.31, 0.32),
+  sma_days = c(280, 300, 320)
+)
+
+# Run sensitivity analysis
+sensitivity_results <- run_sensitivity_analysis("QQQ", "2000-01-01", Sys.Date(), param_grid)
+
+# Analyze results
+best_params <- sensitivity_results %>%
+  arrange(desc(sharpe_ratio)) %>%
+  slice(1)
+
+print(best_params)
+
+# Visualize results
+sensitivity_results %>%
+  ggplot(aes(x = total_return, y = sharpe_ratio)) +
+  geom_point(alpha = 0.5) +
+  geom_point(data = best_params, color = "red", size = 3) +
+  labs(title = "Sensitivity Analysis Results",
+       x = "Total Return",
+       y = "Sharpe Ratio") +
+  theme_minimal()
+
+# Function to analyze edge across multiple stocks
+analyze_edge <- function(symbols, start_date, end_date, best_params) {
+  plan(multisession)
+  
+  results <- future_map_dfr(symbols, function(symbol) {
+    tryCatch({
+      data <- get_stock_data(symbol, start_date, end_date)
+      strategy_results <- implement_strategy(data, best_params$roll_mean_days, 
+                                             best_params$lower_band_days, 
+                                             best_params$lower_band_mult, 
+                                             best_params$ibs_threshold, 
+                                             best_params$sma_days)
+      
+      tibble(
+        symbol = symbol,
+        total_return = last(strategy_results$cum_returns),
+        sharpe_ratio = SharpeRatio(strategy_results$returns, Rf = 0, p = 0.95)[1],
+        num_trades = sum(diff(strategy_results$signal) == 1),
+        win_rate = mean(strategy_results$returns[strategy_results$signal == 1] > 0, na.rm = TRUE)
+      )
+    }, error = function(e) NULL)
+  }, .progress = TRUE)
+  
+  plan(sequential)
+  
+  results
+}
+
+# Get list of all stocks (you'll need to provide this list)
+all_stocks <- c("AAPL", "MSFT", "AMZN", "GOOGL", "FB")  # Example list, replace with actual list
+
+# Analyze edge across all stocks
+edge_analysis <- analyze_edge(all_stocks, "1998-01-01", Sys.Date(), best_params)
+
+# Visualize edge analysis results
+edge_analysis %>%
+  ggplot(aes(x = total_return, y = sharpe_ratio, size = num_trades, color = win_rate)) +
+  geom_point(alpha = 0.5) +
+  scale_color_viridis_c() +
+  labs(title = "Edge Analysis Across All Stocks",
+       x = "Total Return",
+       y = "Sharpe Ratio",
+       size = "Number of Trades",
+       color = "Win Rate") +
+  theme_minimal()
+
+# Function to implement multi-instrument strategy
+implement_multi_instrument_strategy <- function(data_list, best_params) {
+  results <- map_dfr(data_list, function(data) {
+    implement_strategy(data, best_params$roll_mean_days, 
+                       best_params$lower_band_days, 
+                       best_params$lower_band_mult, 
+                       best_params$ibs_threshold, 
+                       best_params$sma_days) %>%
+      select(date, returns)
+  })
+  
+  results %>%
+    group_by(date) %>%
+    summarize(returns = mean(returns, na.rm = TRUE)) %>%
+    mutate(cum_returns = cumprod(1 + returns) - 1)
+}
+
+# Select top instruments based on edge analysis
+top_instruments <- edge_analysis %>%
+  arrange(desc(sharpe_ratio)) %>%
+  slice_head(n = 10) %>%
+  pull(symbol)
+
+# Get data for top instruments
+top_instrument_data <- map(top_instruments, ~get_stock_data(.x, "1998-01-01", Sys.Date()))
+
+# Implement multi-instrument strategy
+multi_instrument_results <- implement_multi_instrument_strategy(top_instrument_data, best_params)
+
+# Compare multi-instrument strategy to original QQQ strategy
+qqq_results <- implement_strategy(get_stock_data("QQQ", "1998-01-01", Sys.Date()),
+                                  best_params$roll_mean_days, 
+                                  best_params$lower_band_days, 
+                                  best_params$lower_band_mult, 
+                                  best_params$ibs_threshold, 
+                                  best_params$sma_days)
+```
+```{r vis}
+
+# Visualize comparison
+bind_rows(
+  multi_instrument_results %>% mutate(strategy = "Multi-Instrument"),
+  qqq_results %>% select(date, cum_returns) %>% mutate(strategy = "QQQ Only")
+) %>%
+  ggplot(aes(x = date, y = cum_returns, color = strategy)) +
+  geom_line() +
+  labs(title = "Multi-Instrument Strategy vs QQQ Only",
+       x = "Date",
+       y = "Cumulative Returns") +
+  theme_minimal()
+```
